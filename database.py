@@ -1,6 +1,6 @@
 import sqlite3
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 
 
 DB_PATH = Path(__file__).parent / "beauty_salon.db"
@@ -220,28 +220,35 @@ def get_last_bookings(limit: int = 20) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def get_bookings_for_service_on_date(
-    service_id: int,
-    date_str: str,
-) -> List[Dict[str, Any]]:
+def get_booked_times_for_date(date_yyyy_mm_dd: str) -> Set[str]:
     """
-    Вернёт все записи на указанную дату для услуги.
-
-    date_str ожидается в формате 'YYYY-MM-DD'.
+    Returns a set of booked start times (HH:MM) for a given date.
+    We treat any booking with status != 'cancelled' as occupying the slot.
     """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, datetime, status
+        SELECT datetime
         FROM bookings
-        WHERE service_id = ?
-          AND datetime LIKE ? || '%'
-        ORDER BY datetime;
+        WHERE datetime LIKE ?
+          AND status != 'cancelled';
         """,
-        (service_id, date_str),
+        (f"{date_yyyy_mm_dd} %",),
     )
     rows = cur.fetchall()
     conn.close()
-    return [dict(row) for row in rows]
+
+    booked: Set[str] = set()
+    for row in rows:
+        dt = row["datetime"]
+        if not dt:
+            continue
+        parts = str(dt).split()
+        if len(parts) < 2:
+            continue
+        time_part = parts[1][:5]
+        if len(time_part) == 5 and time_part[2] == ":":
+            booked.add(time_part)
+    return booked
 

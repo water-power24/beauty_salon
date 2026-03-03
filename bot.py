@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from aiogram.enums import ParseMode
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -29,12 +29,57 @@ bot = Bot(BOT_TOKEN)
 bot.parse_mode = ParseMode.HTML
 dp = Dispatcher(storage=MemoryStorage())
 
+RU_WEEKDAY = {
+    0: "Пн",
+    1: "Вт",
+    2: "Ср",
+    3: "Чт",
+    4: "Пт",
+    5: "Сб",
+    6: "Вс",
+}
+
+
+def get_next_workdays(count: int = 6):
+    days = []
+    d = datetime.now().date()
+    while len(days) < count:
+        if d.weekday() != 6:  # 6 дней в неделю: пропускаем воскресенье
+            days.append(d)
+        d = d + timedelta(days=1)
+    return days
+
+
+def build_days_keyboard(days):
+    kb = InlineKeyboardBuilder()
+    for d in days:
+        label = f"{RU_WEEKDAY[d.weekday()]} {d.strftime('%d.%m')}"
+        kb.button(text=label, callback_data=f"bookday:{d.strftime('%Y-%m-%d')}")
+    kb.adjust(3)
+    return kb.as_markup()
+
+
+def build_times_keyboard(date_yyyy_mm_dd: str, booked_times):
+    kb = InlineKeyboardBuilder()
+    for hour in range(10, 18):  # 10:00 .. 17:00
+        t = f"{hour:02d}:00"
+        if t in booked_times:
+            kb.button(text=f"❌ {t}", callback_data=f"bookbusy:{t}")
+        else:
+            kb.button(text=t, callback_data=f"booktime:{t}")
+
+    kb.button(text="⬅ К выбору дня", callback_data="book_back_days")
+    kb.adjust(4, 1)
+    return kb.as_markup()
+
 
 def is_admin(user_id: int) -> bool:
     return int(user_id) in ADMIN_IDS
 
 
 class BookingStates(StatesGroup):
+    waiting_for_day = State()
+    waiting_for_time = State()
     waiting_for_name = State()
     waiting_for_phone = State()
 
@@ -97,8 +142,8 @@ async def cmd_start(message: Message):
         "Здравствуйте! 👋\n\n"
         "Я бот салона красоты.\n\n"
         "Вы можете:\n"
-        "• посмотреть <b>прайс-лист</b> по услугам;\n"
-        "• <b>записаться</b> на выбранную услугу.\n\n"
+        "• посмотреть прайс-лист по услугам;\n"
+        "• записаться на выбранную услугу.\n\n"
         "Выберите нужный раздел в меню ниже."
     )
     await message.answer(text, reply_markup=main_menu_keyboard())
@@ -145,19 +190,19 @@ async def show_services_in_category(call: CallbackQuery):
     services = database.get_services_by_category(category)
     if not services:
         await call.message.edit_text(
-            f"В категории <b>{category}</b> пока нет услуг."
+            f"В категории {category} пока нет услуг."
         )
         await call.answer()
         return
 
     kb = InlineKeyboardBuilder()
-    text_lines = [f"Категория: <b>{category}</b>\n"]
-    for idx, s in enumerate(services, start=1):
+    text_lines = [f"Категория: {category}\n"]
+    for s in services:
         line = (
-            f"{idx}) <b>{s['name']}</b>\n"
+            f"#{s['id']} {s['name']}\n"
             f"{s['description'] or 'Без описания'}\n"
-            f"💰 <b>{s['price']:.0f} ₽</b>   ⏱ <b>{s['duration_minutes']} мин</b>\n"
-            f"───────────\n"
+            f"Цена: {s['price']:.0f} ₽, "
+            f"время: {s['duration_minutes']} мин\n"
         )
         text_lines.append(line)
         kb.button(
@@ -186,11 +231,11 @@ async def show_service_details(call: CallbackQuery, state: FSMContext):
         return
 
     text = (
-        f"<b>{service['name']}</b>\n\n"
+        f"{service['name']}\n\n"
         f"{service['description'] or 'Без описания'}\n\n"
-        f"Категория: <b>{service['category']}</b>\n"
-        f"Цена: <b>{service['price']:.0f} ₽</b>\n"
-        f"Время выполнения: <b>{service['duration_minutes']} мин</b>"
+        f"Категория: {service['category']}\n"
+        f"Цена: {service['price']:.0f} ₽\n"
+        f"Время выполнения: {service['duration_minutes']} мин"
     )
 
     kb = InlineKeyboardBuilder()
@@ -251,137 +296,76 @@ async def book_selected_service(call: CallbackQuery, state: FSMContext):
         return
 
     await state.update_data(service_id=service_id)
+    await state.set_state(BookingStates.waiting_for_day)
 
-    # Показать выбор даты на ближайшие 7 дней
-    today = datetime.now().date()
-    kb = InlineKeyboardBuilder()
-    for i in range(7):
-        day = today + timedelta(days=i)
-        date_str = day.strftime("%Y-%m-%d")
-        btn_text = day.strftime("%d.%m (%a)")
-        kb.button(
-            text=btn_text,
-            callback_data=f"pick_date:{service_id}:{date_str}",
-        )
-    kb.adjust(2)
-
+    days = get_next_workdays(6)
     await call.message.edit_text(
-        f"Вы выбрали услугу <b>{service['name']}</b>.\n\n"
-        "Выберите, пожалуйста, удобную дату из доступных ниже:",
-        reply_markup=kb.as_markup(),
+        f"Вы выбрали услугу {service['name']}.\n\n"
+        "Выберите день для записи (6 дней в неделю):",
+        reply_markup=build_days_keyboard(days),
     )
     await call.answer()
 
 
-def _build_time_slots_keyboard(
-    service_id: int,
-    date_str: str,
-) -> InlineKeyboardBuilder:
-    """
-    Создаёт клавиатуру со свободными слотами на день
-    с 10:00 до 17:00, шаг 1 час.
-    """
-    from database import get_bookings_for_service_on_date, get_service
+@dp.callback_query(F.data.startswith("bookday:"))
+async def booking_pick_day(call: CallbackQuery, state: FSMContext):
+    date_str = call.data.split(":", maxsplit=1)[1]
+    await state.update_data(date_str=date_str)
+    await state.set_state(BookingStates.waiting_for_time)
 
-    # Получаем уже занятые даты/время
-    bookings = get_bookings_for_service_on_date(service_id, date_str)
-    busy_datetimes = {b["datetime"] for b in bookings}
-
-    # Получим длительность, если в будущем потребуется учитывать не 1 час
-    service = get_service(service_id)
-    duration_minutes = service["duration_minutes"] if service else 60
-
-    date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
-    start_hour = 10
-    end_hour = 17
-
-    kb = InlineKeyboardBuilder()
-    for hour in range(start_hour, end_hour):
-        slot_start = datetime(
-            year=date_obj.year,
-            month=date_obj.month,
-            day=date_obj.day,
-            hour=hour,
-            minute=0,
-        )
-        dt_str = slot_start.strftime("%Y-%m-%d %H:%M")
-
-        # Считаем слот занятым, если начало совпадает с существующей записью
-        if dt_str in busy_datetimes:
-            continue
-
-        time_label = slot_start.strftime("%H:%M")
-        kb.button(
-            text=time_label,
-            callback_data=f"pick_time:{service_id}:{date_str}:{time_label}",
-        )
-
-    kb.adjust(4)
-    return kb
-
-
-@dp.callback_query(F.data.startswith("pick_date:"))
-async def booking_pick_date(call: CallbackQuery, state: FSMContext):
-    try:
-        _, service_id_str, date_str = call.data.split(":", maxsplit=2)
-        service_id = int(service_id_str)
-    except (ValueError, IndexError):
-        await call.answer("Ошибка выбора даты.", show_alert=True)
-        return
-
-    service = database.get_service(service_id)
-    if not service:
-        await call.answer("Услуга не найдена.", show_alert=True)
-        return
-
-    kb = _build_time_slots_keyboard(service_id, date_str)
-
-    # Текст с наглядной таблицей слотов
-    date_human = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
-    header = (
-        f"Запись на услугу <b>{service['name']}</b>\n"
-        f"Дата: <b>{date_human}</b>\n\n"
-        "Доступные слоты (каждый по 1 часу):\n"
-        "Нажмите на удобное время."
+    booked = database.get_booked_times_for_date(date_str)
+    pretty_day = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
+    await call.message.edit_text(
+        f"Выбран день: {pretty_day}\n\nВыберите время:",
+        reply_markup=build_times_keyboard(date_str, booked),
     )
-
-    await call.message.edit_text(header, reply_markup=kb.as_markup())
     await call.answer()
 
 
-@dp.callback_query(F.data.startswith("pick_time:"))
+@dp.callback_query(F.data == "book_back_days")
+async def booking_back_to_days(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    service_id = data.get("service_id")
+    service = database.get_service(service_id) if service_id else None
+
+    await state.set_state(BookingStates.waiting_for_day)
+    days = get_next_workdays(6)
+    await call.message.edit_text(
+        f"Вы выбрали услугу {service['name'] if service else ''}.\n\n"
+        "Выберите день для записи (6 дней в неделю):",
+        reply_markup=build_days_keyboard(days),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("bookbusy:"))
+async def booking_busy_time(call: CallbackQuery):
+    time_str = call.data.split(":", maxsplit=1)[1]
+    await call.answer(f"{time_str} уже занято.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("booktime:"))
 async def booking_pick_time(call: CallbackQuery, state: FSMContext):
-    try:
-        _, service_id_str, date_str, time_str = call.data.split(":", maxsplit=3)
-        service_id = int(service_id_str)
-    except (ValueError, IndexError):
-        await call.answer("Ошибка выбора времени.", show_alert=True)
+    time_str = call.data.split(":", maxsplit=1)[1]
+    data = await state.get_data()
+    date_str = data.get("date_str")
+    if not date_str:
+        await call.answer("Сначала выберите день.", show_alert=True)
         return
 
-    service = database.get_service(service_id)
-    if not service:
-        await call.answer("Услуга не найдена.", show_alert=True)
+    booked = database.get_booked_times_for_date(date_str)
+    if time_str in booked:
+        await call.answer("Это время уже занято. Выберите другое.", show_alert=True)
         return
 
-    # Проверим, не занято ли уже это время (на случай одновременного выбора)
-    from database import get_bookings_for_service_on_date
-
-    bookings = get_bookings_for_service_on_date(service_id, date_str)
-    full_dt_str = f"{date_str} {time_str}"
-    if any(b["datetime"] == full_dt_str for b in bookings):
-        await call.answer(
-            "К сожалению, это время уже успели забронировать. Выберите другое.",
-            show_alert=True,
-        )
-        return
-
-    await state.update_data(service_id=service_id, datetime_str=full_dt_str)
+    await state.update_data(datetime_str=f"{date_str} {time_str}")
     await state.set_state(BookingStates.waiting_for_name)
 
+    pretty_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").strftime(
+        "%d.%m.%Y %H:%M"
+    )
     await call.message.edit_text(
-        f"Вы выбрали услугу <b>{service['name']}</b>\n"
-        f"Дата и время: <b>{full_dt_str}</b>\n\n"
-        "Теперь введите, пожалуйста, ваше <b>имя и фамилию</b>."
+        f"Запись на {pretty_dt}.\n\nВведите, пожалуйста, ваше имя и фамилию."
     )
     await call.answer()
 
@@ -396,7 +380,7 @@ async def booking_get_name(message: Message, state: FSMContext):
     await state.update_data(full_name=full_name)
     await state.set_state(BookingStates.waiting_for_phone)
     await message.answer(
-        "Теперь введите, пожалуйста, ваш <b>номер телефона</b> для связи."
+        "Теперь введите, пожалуйста, ваш номер телефона для связи."
     )
 
 
@@ -433,11 +417,11 @@ async def booking_get_phone(message: Message, state: FSMContext):
 
     confirm_text = (
         "Спасибо! Ваша заявка на запись отправлена администратору. ✅\n\n"
-        f"<b>Номер заявки:</b> #{booking_id}\n"
-        f"<b>Услуга:</b> {service['name']}\n"
-        f"<b>Дата и время:</b> {data['datetime_str']}\n"
-        f"<b>Имя:</b> {data['full_name']}\n"
-        f"<b>Телефон:</b> {phone}\n\n"
+        f"Номер заявки: #{booking_id}\n"
+        f"Услуга: {service['name']}\n"
+        f"Дата и время: {data['datetime_str']}\n"
+        f"Имя: {data['full_name']}\n"
+        f"Телефон: {phone}\n\n"
         "Администратор свяжется с вами для подтверждения времени."
     )
     await message.answer(confirm_text, reply_markup=main_menu_keyboard())
@@ -474,9 +458,9 @@ async def admin_list_services(message: Message):
     for s in services:
         lines.append(
             f"#{s['id']} [{s['category']}]\n"
-            f"<b>{s['name']}</b>\n"
+            f"{s['name']}\n"
             f"{s['description'] or 'Без описания'}\n"
-            f"Цена: <b>{s['price']:.0f} ₽</b>, время: <b>{s['duration_minutes']} мин</b>\n"
+            f"Цена: {s['price']:.0f} ₽, время: {s['duration_minutes']} мин\n"
         )
     await message.answer("\n".join(lines))
 
@@ -489,7 +473,7 @@ async def admin_add_service_start(message: Message, state: FSMContext):
     await state.set_state(AddServiceStates.waiting_for_category)
     await message.answer(
         "Добавление новой услуги.\n\n"
-        "Введите <b>категорию</b> (например: Маникюр, Педикюр, Уход за кожей)."
+        "Введите категорию (например: Маникюр, Педикюр, Уход за кожей)."
     )
 
 
@@ -497,14 +481,16 @@ async def admin_add_service_start(message: Message, state: FSMContext):
 async def admin_add_service_category(message: Message, state: FSMContext):
     await state.update_data(category=message.text.strip())
     await state.set_state(AddServiceStates.waiting_for_name)
-    await message.answer("Введите <b>название услуги</b>.")
+    await message.answer("Введите название услуги.")
 
 
 @dp.message(AddServiceStates.waiting_for_name)
 async def admin_add_service_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
     await state.set_state(AddServiceStates.waiting_for_description)
-    await message.answer("Введите <b>описание услуги</b> (или '-' если без описания).")
+    await message.answer(
+        "Введите описание услуги (или '-' если без описания)."
+    )
 
 
 @dp.message(AddServiceStates.waiting_for_description)
@@ -514,7 +500,9 @@ async def admin_add_service_description(message: Message, state: FSMContext):
         desc = ""
     await state.update_data(description=desc)
     await state.set_state(AddServiceStates.waiting_for_price)
-    await message.answer("Введите <b>цену</b> услуги (только число, без валюты).")
+    await message.answer(
+        "Введите цену услуги (только число, без валюты)."
+    )
 
 
 @dp.message(AddServiceStates.waiting_for_price)
@@ -529,7 +517,7 @@ async def admin_add_service_price(message: Message, state: FSMContext):
     await state.update_data(price=price)
     await state.set_state(AddServiceStates.waiting_for_duration)
     await message.answer(
-        "Введите <b>время выполнения</b> в минутах (например, 60)."
+        "Введите время выполнения в минутах (например, 60)."
     )
 
 
@@ -579,8 +567,7 @@ async def admin_update_price_start(message: Message, state: FSMContext):
             f"#{s['id']} [{s['category']}] {s['name']} — {s['price']:.0f} ₽"
         )
     await message.answer(
-        "\n".join(lines)
-        + "\n\nОтправьте <b>ID услуги</b>, у которой нужно изменить цену."
+        "\n".join(lines) + "\n\nОтправьте ID услуги, у которой нужно изменить цену."
     )
     await state.set_state(UpdatePriceStates.waiting_for_service_id)
 
@@ -601,8 +588,8 @@ async def admin_update_price_get_id(message: Message, state: FSMContext):
     await state.update_data(service_id=service_id)
     await state.set_state(UpdatePriceStates.waiting_for_new_price)
     await message.answer(
-        f"Текущая цена услуги <b>{service['name']}</b>: {service['price']:.0f} ₽.\n"
-        "Введите <b>новую цену</b> (только число)."
+        f"Текущая цена услуги {service['name']}: {service['price']:.0f} ₽.\n"
+        "Введите новую цену (только число)."
     )
 
 
@@ -624,9 +611,11 @@ async def admin_update_price_set_new(message: Message, state: FSMContext):
 
     await message.answer(
         "Цена успешно обновлена ✅\n\n"
-        f"Услуга: <b>{service['name']}</b>\n"
-        f"Новая цена: <b>{service['price']:.0f} ₽</b>"
+        f"Услуга: {service['name']}\n"
+        f"Новая цена: {service['price']:.0f} ₽"
     )
+
+
 
 
 @dp.message(F.text == "⏱ Обновить время")
@@ -645,8 +634,7 @@ async def admin_update_duration_start(message: Message, state: FSMContext):
             f"#{s['id']} [{s['category']}] {s['name']} — {s['duration_minutes']} мин"
         )
     await message.answer(
-        "\n".join(lines)
-        + "\n\nОтправьте <b>ID услуги</b>, у которой нужно изменить время."
+        "\n".join(lines) + "\n\nОтправьте ID услуги, у которой нужно изменить время."
     )
     await state.set_state(UpdateDurationStates.waiting_for_service_id)
 
@@ -667,8 +655,8 @@ async def admin_update_duration_get_id(message: Message, state: FSMContext):
     await state.update_data(service_id=service_id)
     await state.set_state(UpdateDurationStates.waiting_for_new_duration)
     await message.answer(
-        f"Текущее время услуги <b>{service['name']}</b>: {service['duration_minutes']} мин.\n"
-        "Введите <b>новое время</b> в минутах (целое число)."
+        f"Текущее время услуги {service['name']}: {service['duration_minutes']} мин.\n"
+        "Введите новое время в минутах (целое число)."
     )
 
 
@@ -691,8 +679,8 @@ async def admin_update_duration_set_new(message: Message, state: FSMContext):
 
     await message.answer(
         "Время услуги успешно обновлено ✅\n\n"
-        f"Услуга: <b>{service['name']}</b>\n"
-        f"Новое время: <b>{service['duration_minutes']} мин</b>"
+        f"Услуга: {service['name']}\n"
+        f"Новое время: {service['duration_minutes']} мин"
     )
 
 
@@ -710,7 +698,7 @@ async def admin_show_bookings(message: Message):
     for b in bookings:
         lines.append(
             f"#{b['id']} — {b['created_at']}\n"
-            f"Услуга: <b>{b['service_name']}</b> ({b['service_category']})\n"
+            f"Услуга: {b['service_name']} ({b['service_category']})\n"
             f"Дата и время: {b['datetime']}\n"
             f"Клиент: {b['full_name']} — {b['phone']}\n"
             f"Telegram: @{b['username'] or 'нет'} (id: {b['user_id']})\n"
